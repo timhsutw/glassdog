@@ -18,7 +18,7 @@ import traceback
 
 PROGRAM = 'glassdog'
 DESCRIPTION = 'Glassdog - A Yara Rule Generator'
-VERSION = '0.0.1'
+VERSION = '0.0.2'
 
 PATTERN_HEADER_VERSION = 'Version'
 PATTERN_HEADER_FILENAME = 'FileName'
@@ -61,6 +61,12 @@ def default_filter_hex(pattern, value):
    return True
 
 def default_filter_strings(pattern, value):
+   if len(value) < 4 or len(value) > 16:
+      return False      
+   hexstr = value.encode('hex')
+   if hexstr.count('20') > len(value)/2:
+         return False
+
    return True
    
 
@@ -106,17 +112,17 @@ class Patterns(object):
          self.filter = default_filter_strings
          self.strings()
 
-   def default_filter_hex(self, value):
-      if value == 0:
-         return False
-      string = struct.pack(self.packchar, value)
-      hexstr = string.encode('hex')
-      if hexstr.count('00') > self.size/2:
-         return False
-      return True
-
-   def default_filter_strings(self, value):
-      return True
+#   def default_filter_hex(self, value):
+#      if value == 0:
+#         return False
+#      string = struct.pack(self.packchar, value)
+#      hexstr = string.encode('hex')
+#      if hexstr.count('00') > self.size/2:
+#         return False
+#      return True
+#
+#   def default_filter_strings(self, value):
+#      return True
    
 
    def hex(self):
@@ -130,18 +136,16 @@ class Patterns(object):
             i += 1
             continue
 
-         if self.pattern[c]:
-            for pdata in self.pattern[c]:
-               index = pdata[0]
-               value = pdata[1]
-               value = value + 1
-               self.pattern[c] = [[index, value]]
+         if c in self.pattern:
+            # add value (count)
+            self.pattern[c][0][1] += 1
          else:
             self.pattern[c].append([i, 1])
             self.match_count = self.match_count + 1
          i = i + 1
       self.search_count += 1
 
+      
    def strings(self):
 
       print 'strings mode'
@@ -170,12 +174,8 @@ class Patterns(object):
                   s = ''
                   i += 1
                   continue
-               if self.pattern[s]:
-                  for pdata in self.pattern[s]:
-                     index = pdata[0]
-                     value = pdata[1]
-                     value = value + 1
-                     self.pattern[s] = [[index, value]]
+               if s in self.pattern:
+                  self.pattern[s][0][1] += 1
                else:
                   self.pattern[s].append([i, 1])
                   self.match_count = self.match_count + 1
@@ -199,18 +199,24 @@ class Patterns(object):
             self.sample_filename = self.header["FileName"]
             self.search_count = self.header["SampleCount"]
             self.size = self.header["PatternSize"]
+            self.type = self.header["PatternType"]
             data = self.header["Pattern"]
             for value in data:
-               for pdata in data[value]:
-                  offset = pdata[0]
-                  count = pdata[1]
-                  c = long(value)
-                  self.pattern[c].append([offset, count])
-                  self.count = self.count + 1
+               offset = data[value][0][0]
+               count = data[value][0][1]
+               index = value
+               if self.type == 'hex':
+                  index = long(value)
+               self.pattern[index].append([offset, count])
+               self.count = self.count + 1
+
+            self.match_count = self.count
             return True
       
-      except:
-         print 'Error while loading %s' % filename
+      except Exception as err:
+         traceback.print_exc()
+
+         print 'Error while loading %s : %s' % (filename, str(err))
          return False
 
    def save(self, filename):
@@ -227,6 +233,7 @@ class Patterns(object):
                       "PatternSize" : self.size,
                       "SampleCount" : self.search_count, 
                       "SampleSHA256" : self.sample_sha256,
+                      "PatternType" : self.type,
                       "Pattern" : save_pattern
                      }
       try:
@@ -270,27 +277,67 @@ class Patterns(object):
       self.start_time = datetime.now()
       self.remove_count = 0
       index = 0
-      while index < len(sample.data)-self.size-1:
-         d = sample.data[index:index+self.size]
-         value, = struct.unpack(self.packchar,d)
-         if self.pattern[value]:
-            if increase is True:
-               for pdata in self.pattern[value]:
-                  offset = pdata[0]
-                  count  = pdata[1]
-                  count  = count + 1
-                  self.pattern[value] = [[offset, count]]
-            else:
-               del self.pattern[value]
-               self.match_count = self.match_count - 1
-               self.remove_count += 1
-         index = index + 1
+
+      if self.type == 'hex':
+         while index < len(sample.data)-self.size-1:
+            try:
+               d = sample.data[index:index+self.size]
+               value, = struct.unpack(self.packchar,d)
+#            if self.pattern[value]:
+               if value in self.pattern:
+                  if increase is True:
+                     self.pattern[value][0][1] += 1
+                  else:
+                     del self.pattern[value]
+                     self.match_count = self.match_count - 1
+                     self.remove_count += 1
+            except Exception as err:
+               print str(err)
+            index = index + 1
+      
+      if self.type == 'strings':
+         control_chars = string.maketrans('', '')[:32]
+         i = 0
+         s = ''
+         start = False
+         while i < len(self.sample.data)-1:
+            try:
+               c = self.sample.data[i]
+               if c in string.printable and not c in control_chars:
+                  if start is False:
+                     start = True
+                  s += c
+                  i += 1
+                  continue
+               else:
+                  if start is True:
+                     start = False
+                     if self.filter is not None and self.filter(self, s) is False:
+                        s = ''
+                        i += 1
+                        continue
+
+                     if s in self.pattern:
+                        if increase is True:
+                           self.pattern[s][0][1] += 1
+                        else:
+                           del self.pattern[s]
+                           self.match_count = self.match_count - 1
+                           self.remove_count += 1
+                           s = ''
+                           i += 1
+                  else:
+                     i += 1
+                     continue
+            except Exception as err:
+               traceback.print_exc()
+               print str(err)
 
       dt = datetime.now() - self.start_time
       self.time_cost = (dt.days * 24 * 60 * 60 + dt.seconds) * 10000 + dt.microseconds 
       self.time_cost_total += self.time_cost
       self.search_count = self.search_count + 1
-
+      
 class Rule(object):
 
    def __init__(self, pattern=None, name=None):
@@ -349,7 +396,7 @@ class Rule(object):
       output += '       sha256 = "%s"\n' % self.pattern.sample_sha256
       output += '       glassdog = "%s"\n' % VERSION
       output += '       date = "%s"\n' % datetime.strftime(datetime.now(), '%Y-%m-%d')
-      output += '    string:\n'
+      output += '    strings:\n'
       pattern_count = 0
       if self.pattern.type == 'hex':
          for s in result_pattern:
@@ -362,15 +409,15 @@ class Rule(object):
                output += ' '
                index += 1
             output += '}\n'
-         pattern_count += 1
-      else:
+            pattern_count += 1
+      if self.pattern.type == 'strings':
          for s in result_pattern:
             length = len(s)
             index = 0
-            output += '      $pattern%d = { ' % pattern_count
+            output += '      $pattern%d = ' % pattern_count
             output += '\"' + s + '\"'
-            output += '}\n'
-         pattern_count += 1
+            output += '\n'
+            pattern_count += 1
 
       output += '    condition:\n'
       if pattern_count > 5:
@@ -498,9 +545,9 @@ if __name__ ==  '__main__':
             print 'Error:No "%s" rule found' % glassdog['select_rule']
             sys.exit(-2)
          hex_pattern = rule.analyze(5, func)
-
-      if glassdog['dump'] is True:
-         rule.dump()
+      print hex_pattern
+   if glassdog['dump'] is True:
+      rule.dump()
          
    if glassdog['savefile'] is not None:
       
